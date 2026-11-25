@@ -93,6 +93,7 @@ const TAB_TITLES = {
   exposure: ['暴露路径台账', '逐段关联计划分配、GPS 实际运行、折返/加班偏离与完整路径'],
   support: ['共同支持', '按时段 × 起讫区间 × 天气 × 可达性检查两臂可比范围'],
   analysis: ['客流结果估计', '乘客旅程加权 ITT、跨线暴露、CACE 与随机化推断区间'],
+  energy: ['车辆能耗归因', 'CAN 校准 × AVL 区段 × 乘客公里：两条路线估计每乘客公里能耗变化'],
   guardrails: ['投诉与满载护栏', '独立于平均候车改善；任一硬护栏超限即停止扩围'],
   review: ['离线审阅', '冻结证据包、确定性复算与完整 JSON 导出'],
   expansion: ['扩围证据', '主要指标 + 护栏证据形成 GO / HOLD / BLOCKED 结论']
@@ -601,6 +602,176 @@ function ciBlock(rows, title) {
         <div class="ci-dot ${cross ? 'zero-cross' : ''}" style="left:${dot}%"></div>
       </div>
       <div class="small mono">${fmt(r.estimate, 1)} [${fmt(r.ci_low, 1)}, ${fmt(r.ci_high, 1)}]</div>
+    </div>`;
+  }).join('');
+}
+
+/* ---------------- 能耗归因 ---------------- */
+const SEG_META = {
+  REVENUE: ['载客', 'blue'], DEADHEAD: ['空驶', 'amber'],
+  IDLE: ['等待', 'gray'], SHORT_TURN: ['折返', 'purple']
+};
+RENDER.energy = async function () {
+  $('#tab-energy').innerHTML = `
+    <div class="toolbar" style="margin-top:0">
+      <button class="btn primary" id="energy-rebuild">重算能耗归因（分析师）</button>
+      <span class="small muted">按设备沿革/CAN/AVL/乘客公里冻结数据离线重算，结果应保持一致</span>
+    </div>
+    <div id="energy-body"><div class="banner">加载中…</div></div>`;
+  $('#energy-rebuild').addEventListener('click', async () => {
+    const b = $('#energy-rebuild'); b.disabled = true; b.innerHTML = '<span class="spinner"></span> 重算中';
+    try {
+      await guardAction(() => api(`/experiments/${EXP.id}/energy/rebuild`, { method: 'POST' }), '能耗归因已重算');
+      await drawEnergy();
+    } finally { b.disabled = false; b.textContent = '重算能耗归因（分析师）'; }
+  });
+  await drawEnergy();
+};
+
+async function drawEnergy() {
+  const [check, estimates, segData, gaps, overview] = await Promise.all([
+    api(`/experiments/${EXP.id}/energy/sample-check`),
+    api(`/experiments/${EXP.id}/energy/estimates`),
+    api(`/experiments/${EXP.id}/energy/segments`),
+    api(`/experiments/${EXP.id}/energy/gaps`),
+    api(`/experiments/${EXP.id}/energy/overview`)
+  ]);
+  const rows = estimates.results || [];
+  const itt = rows.filter(r => r.estimator_code === 'ITT_RATE');
+  const ri = rows.filter(r => r.estimator_code === 'RI_RATE');
+  const arms = rows.filter(r => r.estimator_code === 'ARM_RATE');
+  const gapTrip = check.twoHourMeterGap || {};
+  const denom = check.denominatorCheck || [];
+  const methodCov = check.methodCoverage || [];
+
+  $('#energy-body').innerHTML = `
+    <div class="banner blue"><span class="big">🧭</span><div>
+      <b>估计纪律：</b>随机分配只关联<b>处理资格</b>（非实际执行者）；分子含载客/空驶/等待/折返全部能耗，
+      分母只计载客段乘客公里；设备故障段绝不当零消耗；校准域之外的坡度报告<b>不可外推</b>，不用全市平均替代。
+    </div></div>
+
+    <div class="grid cards-4">
+      ${stat('处理/对照资格班次', (check.tripsByAssignedArm || []).map(x => `${x.trips}`).join(' / '), '同一车辆各 6 班')}
+      ${stat('2 小时电量缺测', gapTrip.gap_points ? `${gapTrip.gap_points} 个 NULL 点` : '—', gapTrip.gap_span || '设备故障，读数非 0', 'red')}
+      ${stat('能耗区段总数', segData.rows.length, `折返段 ${(segData.typeSummary || []).find(t => t.segment_type === 'SHORT_TURN')?.n || 0} 个`)}
+      ${stat('覆盖缺口', gaps.rows.length, '缺测/未观测/超校准域', 'amber')}
+    </div>
+
+    <div class="grid cards-2" style="margin-top:14px">
+      <div class="card">
+        <h3>① 分母核验：乘客公里只在载客段产生</h3>
+        <table class="data"><thead><tr><th>区段</th><th class="num">段数</th><th class="num">乘客公里</th><th>非载客恒 0</th></tr></thead>
+        <tbody>${denom.map(d => `<tr>
+          <td>${(SEG_META[d.segment_type] || [d.segment_type])[0]}</td>
+          <td class="num">${d.segments}</td>
+          <td class="num mono">${fmt(d.passenger_km, 1)}</td>
+          <td>${d.zero_when_non_revenue === true || d.segment_type === 'REVENUE'
+            ? (d.segment_type === 'REVENUE' ? badge('载客段计分', 'blue') : badge('✓ 0', 'green'))
+            : badge('异常', 'red')}</td>
+        </tr>`).join('')}</tbody></table>
+        <p class="small muted" style="margin-bottom:0">空驶/等待/折返段乘客公里恒为 0，但其能耗仍计入每乘客公里能耗的分子。</p>
+      </div>
+      <div class="card">
+        <h3>② 两条估计路线的可估范围</h3>
+        <table class="data"><thead><tr><th>路线</th><th class="num">可估段</th><th class="num">剔除段</th><th class="num">平均观测覆盖</th></tr></thead>
+        <tbody>${methodCov.map(c => `<tr>
+          <td><b>${c.route_method === 'TELEMETRY' ? '遥测积分（贴近）' : '曲线重建（覆盖全）'}</b></td>
+          <td class="num">${c.estimable_segments}</td>
+          <td class="num ${c.dropped_segments > 0 ? 'expected-bad' : ''}">${c.dropped_segments}</td>
+          <td class="num mono">${pct(c.avg_observed_share, 1)}</td>
+        </tr>`).join('')}</tbody></table>
+        <ul class="small" style="margin-bottom:0">
+          <li>遥测路线：传感器缺口直接<b>收缩可估范围</b>（缺测班整单元剔除）。</li>
+          <li>重建路线：同车速度—坡度曲线补全缺测，<b>参数协方差+模型残差传播</b>使区间变宽；坡度域外拒绝外推。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <h3>③ 每乘客公里能耗效应（kWh/人公里，处理 − 对照）</h3>
+      <p class="section-desc">同一试点人群、同一随机分配下两条路线各自给出效应；正值表示缩短间隔反而抬高单位乘客公里能耗
+        （怠速下降被空驶折返、额外车辆抵消）。ITT 为乘客公里加权 Hajek + CR1；RI 枚举全部平衡分配。</p>
+      ${energyCiBlock(itt, 'ITT（CR1 随机化单元聚类区间）')}
+      <div style="height:10px"></div>
+      ${energyCiBlock(ri, '精确随机化推断（Hodges–Lehmann 区间，plus-one p）')}
+      <h3 style="margin-top:14px">臂级总量比率（Σ能耗 / Σ乘客公里）</h3>
+      <table class="data"><thead><tr><th>路线</th><th>臂</th><th class="num">kWh/人公里</th><th class="num">总能耗 kWh</th><th class="num">总乘客公里</th><th class="num">覆盖</th></tr></thead>
+      <tbody>${arms.map(a => `<tr>
+        <td>${a.route_method === 'TELEMETRY' ? '遥测' : '重建'}</td>
+        <td>${armBadge(a.arm)}</td>
+        <td class="num mono"><b>${fmt(a.energy_per_pkm, 4)}</b></td>
+        <td class="num mono">${fmt(a.total_energy_kwh, 2)}</td>
+        <td class="num mono">${fmt(a.total_passenger_km, 1)}</td>
+        <td class="num">${pct(a.coverage_share, 1)}</td>
+      </tr>`).join('')}</tbody></table>
+    </div>
+
+    <div class="grid cards-2" style="margin-top:14px">
+      <div class="card">
+        <h3>④ 覆盖缺口与处理方式</h3>
+        <div class="table-wrap" style="max-height:340px"><table class="data">
+          <thead><tr><th>车辆/区段</th><th>类型</th><th>路线</th><th>处理</th></tr></thead>
+          <tbody>${gaps.rows.map(g => `<tr>
+            <td class="small"><code>${g.segment_code ? g.segment_code.replace('SEG:V-EV-01:', '') : g.vehicle_code}</code></td>
+            <td>${badge(g.gap_kind, g.gap_kind === 'SENSOR_GAP' ? 'red' : 'amber')}</td>
+            <td class="small">${g.route_method === 'TELEMETRY' ? '遥测' : '重建'}</td>
+            <td class="small">${g.handling === 'NOT_EXTRAPOLATED' ? badge('拒绝外推', 'red')
+              : g.handling === 'RECONSTRUCTED' ? badge('曲线重建', 'blue') : badge('剔除', 'gray')}</td>
+          </tr>`).join('')}</tbody></table></div>
+      </div>
+      <div class="card">
+        <h3>⑤ 车辆设备沿革与同车校准</h3>
+        ${(overview.deviceHistory || []).map(h => `<div class="kv-row" style="margin-bottom:8px">
+          <code>${h.device_code}</code>（${h.device_kind}）<br/>
+          <span class="small muted">有效期 ${dt(h.valid_from)} → ${h.valid_to ? dt(h.valid_to) : '至今'}；
+            校准 factor=${h.calibration_factor}，相对 SE=${(h.calibration_se * 100).toFixed(1)}%，n=${h.calibration_n}</span>
+        </div>`).join('')}
+        ${(overview.curves || []).map(c => `<div class="banner amber" style="margin-top:8px">
+          <div class="small"><b>速度—坡度曲线</b>：P=${c.alpha}+${c.beta1}v+${c.beta2}v²+${c.beta3}v³+${c.gamma}v·g<br/>
+          同车校准支撑域：坡度 [${c.grade_min_observed}%, ${c.grade_max_observed}%]，速度 ≤ ${c.speed_max_observed} km/h（R²=${c.calibrated_r2}）。域外不外推。</div></div>`).join('')}
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <h3>⑥ 分段能耗台账（两路线对照）</h3>
+      <div class="table-wrap" style="max-height:520px"><table class="data">
+        <thead><tr><th>班次/区段</th><th>类型</th><th>资格臂</th><th>执行</th><th class="num">乘客公里</th>
+          <th class="num">遥测 kWh</th><th class="num">重建 kWh</th><th class="num">重建 SE</th><th>标记</th></tr></thead>
+        <tbody>${segData.rows.map(s => {
+          const meta = SEG_META[s.segment_type] || [s.segment_type, 'gray'];
+          return `<tr>
+          <td class="small"><code>${(s.segment_code || '').replace('SEG:V-EV-01:', '')}</code></td>
+          <td>${badge(meta[0], meta[1])}</td>
+          <td>${armBadge(s.assigned_arm)}</td>
+          <td>${s.rule_executed ? badge('是', 'green') : badge('否', 'gray')}</td>
+          <td class="num mono">${fmt(s.passenger_km, 1)}</td>
+          <td class="num mono">${s.telemetry_kwh == null ? badge('缺测剔除', 'red') : fmt(s.telemetry_kwh, 2)}</td>
+          <td class="num mono">${s.reconstructed_kwh == null ? badge('不可外推', 'red') : fmt(s.reconstructed_kwh, 2)}</td>
+          <td class="num mono">${s.reconstructed_se == null ? '—' : fmt(s.reconstructed_se, 3)}</td>
+          <td>${s.reconstructed_extrapolated ? badge('缺测重建', 'blue') : ''}
+              ${s.reconstructed_outside ? badge('超校准域', 'red') : ''}</td>
+        </tr>`;
+        }).join('')}</tbody></table></div>
+    </div>`;
+}
+
+function energyCiBlock(rows, title) {
+  if (!rows.length) return '';
+  return `<h3 style="margin-bottom:4px">${title}</h3>` + rows.map(r => {
+    const lo = r.ci_low, hi = r.ci_high, est = r.energy_per_pkm;
+    const maxAbs = Math.max(Math.abs(lo || 0), Math.abs(hi || 0), 0.0001);
+    const left = ((lo + maxAbs) / (2 * maxAbs)) * 100;
+    const width = Math.max(1, ((hi - lo) / (2 * maxAbs)) * 100);
+    const dot = ((est + maxAbs) / (2 * maxAbs)) * 100;
+    const cross = lo < 0 && hi > 0;
+    const name = r.route_method === 'TELEMETRY' ? '遥测积分（窄覆盖、贴近测量）' : '曲线重建（宽覆盖、误差传播）';
+    return `<div class="ci-row">
+      <div><b>${name}</b><div class="small muted">${r.n_units} 随机化单元 · 覆盖 ${pct(r.coverage_share, 1)}${r.p_value != null ? ' · p=' + fmt(r.p_value, 4) : ''}</div></div>
+      <div class="ci-track">
+        <div class="ci-line ${cross ? 'zero-cross' : ''}" style="left:${left}%;width:${width}%"></div>
+        <div class="ci-dot ${cross ? 'zero-cross' : ''}" style="left:${dot}%"></div>
+      </div>
+      <div class="small mono">${fmt(est, 4)} [${fmt(lo, 4)}, ${fmt(hi, 4)}]</div>
     </div>`;
   }).join('');
 }

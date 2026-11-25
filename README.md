@@ -15,7 +15,8 @@
 6. **估计器**：乘客人数加权 Hajek **ITT**、按随机化单元聚类的 CR1 区间、CACE/Wald-IV、跨线暴露率 Wilson 区间、簇方案 2⁴ 随机化推断（RI）。
 7. **独立护栏**：投诉率、满载班次占比、滞留/未完成旅程占比；任一硬护栏超限即 `STOP_EXPANSION`，扩围结论 `BLOCKED`，服务端同时拒绝人工改判 `GO`。
 8. **外部事件按事件时间关联**：暴雨停运、降雨、施工、临时改线均带事件窗口；投诉同时保存 `complaint_time` 与 `service_event_time`，统计只用后者。
-9. **界面**：随机分配、暴露路径、共同支持、客流结果、护栏、离线审阅、扩围证据等 10 个标签页；另含 Swagger UI / OpenAPI 3。
+9. **车辆能耗归因（feature-3）**：CAN 燃油/电量按车辆**设备沿革**逐设备校准，AVL 轨迹切成载客/空驶/等待/折返区段，刷卡+满载计数给乘客公里；随机分配只关联**处理资格**而非实际执行者。两条路线（遥测积分 / 同车速度—坡度曲线重建）分别估计**每乘客公里能耗**变化与随机化区间；设备故障段不当零消耗，校准域外坡度报告不可外推。
+10. **界面**：随机分配、暴露路径、共同支持、客流结果、**能耗归因**、护栏、离线审阅、扩围证据等 11 个标签页；另含 Swagger UI / OpenAPI 3。
 
 ---
 
@@ -115,13 +116,15 @@ mvn test
 结果（最后一次实际运行）：
 
 ```
-Tests run: 16, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 28, Failures: 0, Errors: 0, Skipped: 0
 BUILD SUCCESS
 ```
 
 覆盖：50% 平衡分配与确定性哈希、R1/R2 聚类/R3 独立、全部命名路径分类
 （分流/同车普通对照/对照转乘处理/全程 T/全程 C/不执行/两类 UNKNOWN）、
-聚类 ITT 公式、Wilson 区间与 RI 枚举。
+聚类 ITT 公式、Wilson 区间与 RI 枚举；以及能耗归因引擎的设备沿革校准、
+故障段拒绝零消耗、换表累计表单调、曲线重建参数误差传播、坡度未观测/超校准域拒绝外推、
+每乘客公里能耗 ITT、覆盖收缩与平衡分配精确随机化推断（`EnergyAttributionEngineTest`，12 项）。
 
 ### 2. 端到端不变量脚本（实际执行 ✅）
 
@@ -134,7 +137,7 @@ BUILD SUCCESS
 脚本仅依赖 `bash/curl/python3`（标准库），实际结果：
 
 ```
-通过 34 项，失败 0 项
+通过 55 项，失败 0 项
 ALL_VERIFY_CHECKS_PASSED
 ```
 
@@ -147,7 +150,9 @@ ALL_VERIFY_CHECKS_PASSED
 - 共同支持缺口存在；投诉、滞留两条护栏超限；
 - 投诉确有滞后提交且按 `service_event_time` 关联；
 - analyst 不能调用扩围评估（403）；approver 得到 `BLOCKED`；护栏超限时人工 `GO` 被拒（409）；
-- `/v3/api-docs`、`/swagger-ui/index.html`、前端页面与 `app.js` 均可访问。
+- 能耗归因：6+6 资格班次、非载客段分母为 0、2 小时缺测读数全 NULL、两路线覆盖收缩/拒绝外推、
+  ITT(CR1)+RI 随机化区间、缺测重建 SE 为正、viewer 重算被 403 且 analyst 重算幂等；
+- `/v3/api-docs`、`/swagger-ui/index.html`、前端页面与 `app.js` 均可访问，前端含能耗归因标签。
 
 ### 3. 前端渲染冒烟（实际执行 ✅）
 
@@ -205,7 +210,68 @@ ALL_VERIFY_CHECKS_PASSED
 
 ---
 
-## 六、主要 HTTP API
+## 六、车辆能耗归因（feature-3）
+
+目标是回答“**缩短发车间隔是否真的降低每乘客公里能耗**”，避免只看到发动机怠速下降，
+却忽略短线折返、空驶和额外车辆。数据集与估计器全部确定性生成、可离线重算。
+
+### 1. 数据模型（`schema.sql` 中 `vehicle* / can_telemetry / avl_point / energy_*`）
+
+- **设备沿革校准**：`vehicle_device_history` 按设备有效期分段保存校准常数与相对标准误。
+  样例纯电车辆 `V-EV-01` 的电量表 `BMS-A210`（factor=1.05，SE 3%）在 2026-06-15 更换为
+  `BMS-B307`（factor=1.02，SE 2%）；换表后的读数绝不套用旧表常数，累计表单调按缺口处理而非负能耗。
+- **AVL 切区段**：`energy_segment` 把轨迹切成 `REVENUE 载客 / DEADHEAD 空驶 / IDLE 等待 / SHORT_TURN 折返`，
+  共享边界时间戳归前一段终点（后续段用半开区间），每段记录速度、坡度与是否观测到坡度。
+- **乘客公里分母**：`segment_passenger_km` 仅在 REVENUE 段由刷卡 OD 平均乘距×人数产生（与满载计数核对）；
+  空驶/等待/折返段恒为 0，但这些段的**能耗仍计入分子**。
+- **随机化只关联资格**：`energy_segment.assigned_arm` 是预注册随机分配的**处理资格**，
+  与 `rule_executed`（司机是否真的执行）分列；ITT 永远按资格臂，不按实际执行者分组。
+
+### 2. 两条估计路线（`EnergyAttributionEngine` + `EnergyService`）
+
+| 路线 | 做法 | 优点 | 代价/纪律 |
+| --- | --- | --- | --- |
+| **TELEMETRY 遥测积分** | 按设备沿革校准后对每车每段相邻有效 CAN 读数梯形积分 | 测量最贴近真实 | 传感器缺口直接**收缩可估范围**，整单元剔除；故障段绝不当 0 |
+| **RECONSTRUCTED 曲线重建** | 同车校准 `P=α+β1v+β2v²+β3v³+γv·g` 对 AVL 积分补全缺测 | 覆盖更全 | 5×5 参数协方差经雅可比传播，缺测段再叠加 `√(1−R²)` 模型残差；坡度未观测/超校准域即**拒绝外推**，不用全市平均 |
+
+单元结果变量为**每乘客公里能耗** `r_u = 单元全部区段能耗（含空驶/等待/折返）/ 单元载客段乘客公里`，
+以乘客公里加权做 Hajek **ITT**（CR1 按随机化单元聚类），并枚举全部平衡分配
+（11 个可估单元、5 处理 → C(11,5)=**462** 种）做精确随机化推断（plus-one p 值 + Hodges–Lehmann 区间）。
+
+### 3. 样例与复现数字（固定种子，重置库后一致）
+
+同一车辆 `V-EV-01` 在 R1 上运行 **6 个处理资格班 + 6 个对照资格班（12 个不同运营日）**：
+5 个执行处理班各含一段空驶折返（0 乘客公里、能耗入分子），1 个处理班司机未执行（ITT 仍归处理臂）；
+**2026-06-08 处理班电量表连续 2 小时缺测（25 个 NULL 点，读数为 NULL 而非 0）**；
+**2026-06-09 对照班**同时含坡度未观测段（DEADHEAD）与超出同车校准域 [-4%,4%] 的 5.8% 陡坡段（REVENUE）。
+
+最近一次重算的每乘客公里能耗（kWh/人公里）：
+
+| 路线 | 处理臂比率 | 对照臂比率 | ITT（CR1 95% CI, p） | RI（HL 区间, plus-one p） | 覆盖 |
+| --- | --- | --- | --- | --- | --- |
+| TELEMETRY | 0.01641 | 0.01155 | **+0.00487** [0.00126, 0.00848], p=0.0053 | [−0.00147, 0.00895], p=0.0151 | 0.909（缺测班剔除） |
+| RECONSTRUCTED | 0.01641 | 0.01149 | **+0.00492** [0.00181, 0.00803], p=0.0008 | [−0.00121, 0.00885], p=0.0151 | 0.922（补全缺测、拒绝 2 段外推） |
+
+**关键结论（正效应）**：缩短间隔后每乘客公里能耗反而上升约 0.0049 kWh/人公里。
+怠速等待确实减少，但处理班新增的空驶折返与额外车辆能耗，分摊到因班次加密而下降的单车乘客公里后，
+单位乘客公里能耗被抬高——这正是题目要求捕捉的“不能只看怠速”。两条独立路线对同一试点人群给出方向一致的结论。
+误差传播可见：缺测班 REVENUE 段重建 SE=2.161，显著大于正常班同型段 1.378。
+
+### 4. 能耗 REST 接口（均在 `/api/experiments/{id}/energy` 下，Swagger 可见）
+
+| 方法/路径 | 作用 |
+| --- | --- |
+| `POST /energy/rebuild` | 用冻结数据重算分段能耗、覆盖缺口与 ITT/RI（ANALYST+，幂等） |
+| `GET /energy/overview` | 车辆、设备沿革、同车曲线与两路线覆盖概览 |
+| `GET /energy/segments` | 分段台账：类型、资格臂、两路线能耗/SE、乘客公里、外推标记 |
+| `GET /energy/estimates` | 两路线臂级比率、ITT(CR1)、精确 RI |
+| `GET /energy/gaps` | 传感器缺测/坡度未观测/超校准域缺口及处理方式 |
+| `GET /energy/telemetry` | CAN 原始流（缺测点 reading=NULL） |
+| `GET /energy/sample-check` | 6+6 班次、分母、2 小时缺测、覆盖与不可外推的一键核验 |
+
+---
+
+## 七、主要 HTTP API
 
 所有 `/api/**` 需登录（表单 Cookie 或 Basic）。完整交互文档：`/swagger-ui.html`。
 
@@ -225,22 +291,23 @@ ALL_VERIFY_CHECKS_PASSED
 | `GET /api/experiments/{id}/expansion`、`POST .../expansion/evaluate|decide` | 扩围证据与结论（APPROVER） |
 | `GET /api/experiments/{id}/review-bundle` | 离线审阅包（冻结配置+分配哈希+追踪+结果） |
 | `GET /api/experiments/{id}/events`、`/complaints` | 外部事件时间线、投诉时间关联核验 |
+| `GET/POST /api/experiments/{id}/energy/**` | 车辆能耗归因：overview/segments/estimates/gaps/telemetry/sample-check/rebuild（详见第六章） |
 
 ---
 
-## 七、目录与实现说明
+## 八、目录与实现说明
 
 ```
 src/main/java/com/ccdev/transit/
-  engine/            # 纯逻辑、无 Spring：确定性哈希、平衡分配、网络聚类、路径分类、统计/RI
-  service/           # 登记冻结、确定性播种器、分析流水线、扩围决策
-  web/               # REST 控制器与 DTO
+  engine/            # 纯逻辑、无 Spring：确定性哈希、平衡分配、网络聚类、路径分类、统计/RI、能耗归因引擎
+  service/           # 登记冻结、确定性播种器（含能耗样例）、分析流水线、能耗归因重算、扩围决策
+  web/               # REST 控制器（含 EnergyController）与 DTO
   config/ security/  # Spring Security 三角色、OpenAPI、jsonb 响应处理
 src/main/resources/
-  schema.sql         # 幂等 PostgreSQL 建表
-  static/            # 原生 JS 单页控制台（login/index/app/styles）
-src/test/java/...    # 16 个纯 JUnit 测试（不依赖数据库/Docker）
-verify.sh            # 34 项端到端不变量
+  schema.sql         # 幂等 PostgreSQL 建表（含车辆/设备/CAN/AVL/能耗 10 张表）
+  static/            # 原生 JS 单页控制台（login/index/app/styles，11 个标签页）
+src/test/java/...    # 28 个纯 JUnit 测试（不依赖数据库/Docker），其中能耗引擎 12 项
+verify.sh            # 55 项端到端不变量
 Dockerfile docker-compose.yml docker-settings.xml
 ```
 
@@ -252,3 +319,7 @@ Dockerfile docker-compose.yml docker-settings.xml
 - **未知保留**：`INCOMPLETE_TAP/MID_ROUTE_CHANGE` 不插补、不归臂、不进效应估计，只计数并进入安全护栏。
 - **共同支持**：无支持层旅程不产生外推结论，仅在支持页与 `gaps` 中报告覆盖缺口。
 - **时间基准**：天气/施工/改线与 `service_ts` 按窗口重叠关联；护栏投诉率按 `complaint.service_event_time` 归集。
+- **能耗资格 ≠ 执行**：`assigned_arm` 是随机分配的处理资格，`rule_executed` 才是实际执行；每乘客公里能耗 ITT 只按资格臂比较。
+- **故障段不是零消耗**：CAN 缺测读数为 NULL；遥测路线整段/整单元剔除并收缩可估范围，重建路线在同车曲线支撑域内补全且传播参数+模型残差误差。
+- **不可外推**：坡度未观测或超出同车校准速度/坡度支撑域时，重建路线直接标记 `NOT_EXTRAPOLATED`，不用全市平均替代。
+- **分子全口径、分母仅载客**：空驶/等待/折返段乘客公里为 0 但能耗计入分子，避免只看怠速下降而忽略折返与额外车辆。

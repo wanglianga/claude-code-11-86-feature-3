@@ -151,14 +151,104 @@ st, body = req("POST", f"/api/experiments/{eid}/expansion/decide",
                body={"decision": "GO", "reason": "try override"})
 check("护栏超限时人工 GO 被服务端拒绝(409)", st == 409, f"status={st}")
 
-# 10. OpenAPI / Swagger / 前端
+# ======================================================================
+# 10. 车辆能耗归因（feature-3）
+# ======================================================================
+st, sc = req("GET", f"/api/experiments/{eid}/energy/sample-check")
+check("能耗样例核验接口可访问", st == 200, str(sc)[:200])
+
+# 10.1 同一车辆处理/对照资格班次各 6 个
+arms = {x["assigned_arm"]: x["trips"] for x in sc.get("tripsByAssignedArm", [])}
+check("同一车辆处理/对照资格班次各 6 个",
+      arms.get("TREATMENT") == 6 and arms.get("CONTROL") == 6, str(arms))
+
+# 10.2 分母核验：空驶/等待/折返段乘客公里恒为 0，仅载客段有乘客公里
+denom = {d["segment_type"]: d for d in sc.get("denominatorCheck", [])}
+non_rev_ok = all(denom.get(t, {}).get("zero_when_non_revenue") is True
+                 for t in ("DEADHEAD", "IDLE", "SHORT_TURN"))
+rev_pkm = denom.get("REVENUE", {}).get("passenger_km", 0)
+check("非载客段(空驶/等待/折返)乘客公里恒为 0", non_rev_ok, str(denom))
+check("仅载客段产生乘客公里且为正", rev_pkm > 0, str(rev_pkm))
+
+# 10.3 电量表 2 小时缺测：读数 NULL（不是 0），跨度 2 小时
+gap = sc.get("twoHourMeterGap", {})
+check("存在 1 个班次的 2 小时电量缺测",
+      gap.get("gap_trips") == 1 and "2 hours" in str(gap.get("gap_span"))
+      and int(gap.get("gap_points", 0)) > 0, str(gap))
+st, tel = req("GET", f"/api/experiments/{eid}/energy/telemetry")
+trows = tel.get("rows", [])
+gap_rows = [r for r in trows if r.get("sensor_gap")]
+check("缺测点读数全部为 NULL 且绝不为 0",
+      gap_rows and all(r.get("reading") is None for r in gap_rows)
+      and not any(r.get("reading") == 0 for r in gap_rows),
+      f"{len(gap_rows)} gap points")
+
+# 10.4 两条路线覆盖范围：遥测因缺测更窄，重建覆盖更全但仍拒绝外推
+cov = {c["route_method"]: c for c in sc.get("methodCoverage", [])}
+tel_cov = cov.get("TELEMETRY", {})
+rec_cov = cov.get("RECONSTRUCTED", {})
+check("遥测路线因传感器缺口收缩可估范围(有剔除段)",
+      int(tel_cov.get("dropped_segments", 0)) >= 1, str(tel_cov))
+check("重建路线覆盖更全(可估段不少于遥测)且仍有不可外推段",
+      int(rec_cov.get("estimable_segments", 0)) >= int(tel_cov.get("estimable_segments", 0))
+      and int(rec_cov.get("dropped_segments", 0)) >= 1, str(rec_cov))
+
+# 10.5 坡度未观测与超出校准域均报告不可外推（不用全市平均）
+not_ext = {(x["gap_reason"], x["route_method"]) for x in sc.get("notExtrapolated", [])}
+check("坡度未观测段标记 GRADE_UNOBSERVED 不可外推",
+      ("GRADE_UNOBSERVED", "RECONSTRUCTED") in not_ext, str(not_ext))
+check("超出同车校准域段标记 OUTSIDE_CALIBRATION 不可外推",
+      ("OUTSIDE_CALIBRATION", "RECONSTRUCTED") in not_ext, str(not_ext))
+
+# 10.6 每乘客公里能耗效应：两路线均有 ITT(CR1) 与精确随机化推断 RI
+st, est = req("GET", f"/api/experiments/{eid}/energy/estimates")
+erows = est.get("results", [])
+def efind(method, code):
+    for r in erows:
+        if r.get("route_method") == method and r.get("estimator_code") == code:
+            return r
+    return None
+for method in ("TELEMETRY", "RECONSTRUCTED"):
+    itt_r = efind(method, "ITT_RATE")
+    ri_r = efind(method, "RI_RATE")
+    arm_rows = [r for r in erows if r.get("route_method") == method and r.get("estimator_code") == "ARM_RATE"]
+    check(f"{method} 路线 ITT 带 CR1 区间与 p 值",
+          bool(itt_r) and itt_r.get("ci_low") is not None and itt_r.get("ci_high") is not None
+          and itt_r.get("p_value") is not None, str(itt_r))
+    check(f"{method} 路线精确随机化推断 RI 存在(plus-one p, HL 区间)",
+          bool(ri_r) and 0 < ri_r.get("p_value", 0) <= 1
+          and ri_r.get("ci_low") is not None and ri_r.get("ci_high") is not None, str(ri_r))
+    check(f"{method} 路线含处理/对照臂级比率",
+          len({r.get("arm") for r in arm_rows}) == 2
+          and all(r.get("energy_per_pkm") is not None for r in arm_rows), str(len(arm_rows)))
+
+# 10.7 重建路线对缺测段的 SE 必须为正（参数误差已传播），且覆盖率口径不同
+st, segs = req("GET", f"/api/experiments/{eid}/energy/segments")
+recon = [s for s in segs.get("rows", []) if s.get("reconstructed_kwh") is not None]
+check("可重建段的重建 SE 全部为正(误差传播)",
+      recon and all((s.get("reconstructed_se") or 0) > 0 for s in recon),
+      f"{len(recon)} reconstructed segments")
+extrap = [s for s in segs.get("rows", []) if s.get("reconstructed_extrapolated")]
+check("缺测段被标记为 extrapolated 重建补全", len(extrap) >= 1, f"{len(extrap)} segments")
+
+# 10.8 权限：viewer 不能触发重算；analyst 可以，且重算幂等
+st, _ = req("POST", f"/api/experiments/{eid}/energy/rebuild", user="viewer", pwd="viewer123")
+check("viewer 重算能耗被 403 拒绝", st == 403, f"status={st}")
+st, rb1 = req("POST", f"/api/experiments/{eid}/energy/rebuild", user="analyst")
+st2, rb2 = req("POST", f"/api/experiments/{eid}/energy/rebuild", user="analyst")
+check("analyst 可重算且结果稳定(段数/缺口一致)",
+      st == 200 and st2 == 200 and rb1.get("segments") == rb2.get("segments")
+      and rb1.get("coverageGaps") == rb2.get("coverageGaps"), f"{rb1} vs {rb2}")
+
+# 11. OpenAPI / Swagger / 前端
 for path in ["/v3/api-docs", "/swagger-ui/index.html", "/index.html", "/login.html", "/app.js"]:
     try:
         with urllib.request.urlopen(BASE + path, timeout=10) as r:
             ok = r.status == 200
-    except Exception as e:
+    except Exception:
         ok = False
     check(f"可访问 {path}", ok)
+check("前端含能耗归因标签", "energy" in urllib.request.urlopen(BASE + "/app.js", timeout=10).read().decode())
 
 print(f"\n通过 {len(passes)} 项，失败 {len(fails)} 项")
 if fails:

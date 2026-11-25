@@ -232,6 +232,25 @@ public class PipelineController {
                 FROM guardrail_evaluation WHERE experiment_id=?
                 ORDER BY id DESC
                 """, id));
+        bundle.put("energyVehicles", jdbc.queryForList(
+                "SELECT vehicle_code,vehicle_type,drivetrain_note FROM vehicle WHERE experiment_id=? ORDER BY vehicle_code", id));
+        bundle.put("energyDeviceHistory", jdbc.queryForList("""
+                SELECT v.vehicle_code,h.device_code,h.valid_from,h.valid_to,h.calibration_factor,
+                       h.calibration_se,h.calibration_n
+                FROM vehicle_device_history h JOIN vehicle v ON v.id=h.vehicle_id
+                WHERE h.experiment_id=? ORDER BY v.vehicle_code,h.valid_from
+                """, id));
+        bundle.put("energyEstimates", jdbc.queryForList("""
+                SELECT route_method,scope,arm,estimator_code,energy_per_pkm,se,ci_low,ci_high,p_value,
+                       total_energy_kwh,total_passenger_km,n_segments,n_units,coverage_share
+                FROM energy_estimate WHERE experiment_id=?
+                ORDER BY route_method,estimator_code,arm NULLS FIRST
+                """, id));
+        bundle.put("energyCoverageGaps", jdbc.queryForList("""
+                SELECT vehicle_code,segment_code,gap_kind,route_method,handling,detail
+                FROM energy_coverage_gap WHERE experiment_id=?
+                ORDER BY route_method,gap_kind,segment_code
+                """, id));
         bundle.put("expansionDecisions", expansion.decisions(id));
         return bundle;
     }
